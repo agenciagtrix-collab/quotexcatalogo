@@ -14,6 +14,7 @@ Variáveis de ambiente:
   QUOTEX_TIMEFRAMES     CSV em segundos, default "60,300,900"
                         (=> 1m, 5m, 15m)
   QUOTEX_ACCOUNT        "demo" (default) ou "real"
+  PROXY_URL             (Opcional) URL do proxy, ex.: "http://user:pass@proxy.com:8080"
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ TIMEFRAMES = [
     if t.strip()
 ]
 ACCOUNT = env("QUOTEX_ACCOUNT", "demo", required=False).lower()
+PROXY_URL = env("PROXY_URL", default=None, required=False)
 
 
 # ---------------------------------------------------------------- ingest
@@ -149,7 +151,16 @@ async def main() -> None:
         ASSETS, TIMEFRAMES, ACCOUNT,
     )
 
-    qx = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD, lang="pt")
+    # Configurar proxy se fornecido
+    proxies = None
+    if PROXY_URL:
+        log.info("[proxy] usando proxy: %s", PROXY_URL)
+        proxies = {
+            "http://": PROXY_URL,
+            "https://": PROXY_URL,
+        }
+
+    qx = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD, lang="pt", proxies=proxies)
     ok, msg = await qx.connect()
     if not ok:
         log.error("[quotex] connect failed: %s", msg)
@@ -169,7 +180,7 @@ async def main() -> None:
     interval = max(15, min(min(TIMEFRAMES) // 4, 60))
     log.info("[poll] interval=%ds", interval)
 
-    async with httpx.AsyncClient() as http:
+    async with httpx.AsyncClient(proxies=proxies) as http:
         while True:
             try:
                 await poll_once(qx, http)
@@ -183,3 +194,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
