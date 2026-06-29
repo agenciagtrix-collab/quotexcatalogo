@@ -143,18 +143,38 @@ async def poll_once(qx: Quotex, http: httpx.AsyncClient) -> None:
         await post_candles(http, batch)
 
 
+async def connect_with_retry(max_retries: int = 10) -> Quotex:
+    """Conecta na Quotex com retry exponencial."""
+    qx = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD, lang="pt")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            ok, msg = await qx.connect()
+            if ok:
+                log.info("[quotex] connected (%s)", msg)
+                return qx
+            else:
+                log.warning("[quotex] connect attempt %d failed: %s", attempt, msg)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[quotex] connect attempt %d error: %s", attempt, e)
+        
+        if attempt < max_retries:
+            # Backoff exponencial: 5s, 10s, 20s, 40s, etc (máx 120s)
+            wait_time = min(5 * (2 ** (attempt - 1)), 120)
+            log.info("[quotex] retrying in %ds (attempt %d/%d)", wait_time, attempt, max_retries)
+            await asyncio.sleep(wait_time)
+    
+    log.error("[quotex] failed to connect after %d attempts", max_retries)
+    sys.exit(2)
+
+
 async def main() -> None:
     log.info(
         "Quotex collector starting | assets=%s | timeframes=%s | account=%s",
         ASSETS, TIMEFRAMES, ACCOUNT,
     )
 
-    qx = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD, lang="pt")
-    ok, msg = await qx.connect()
-    if not ok:
-        log.error("[quotex] connect failed: %s", msg)
-        sys.exit(2)
-    log.info("[quotex] connected (%s)", msg)
+    qx = await connect_with_retry()
 
     await qx.change_account(
         AccountType.REAL if ACCOUNT == "real" else AccountType.DEMO
@@ -183,3 +203,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
