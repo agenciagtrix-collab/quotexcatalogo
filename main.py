@@ -1,28 +1,16 @@
 """
-Quotex collector worker — Fase 3.
+Quotex collector worker — Fase 4.
 
 Modos:
   python main.py            → live polling (default)
   python main.py --backfill → backfill últimos 7 dias e sai
 
-Features:
-- Polling de velas fechadas (M1/M5/M15) via pyquotex
-- Envio em lote para POST {INGEST_URL} assinado com HMAC-SHA256
-- Heartbeat a cada ciclo para POST {HEARTBEAT_URL}
-- Logs estruturados em JSON (Railway-friendly)
-- Backfill histórico de N dias (BACKFILL_DAYS, default 7)
-
-Variáveis de ambiente:
-  INGEST_URL            URL pública /api/public/ingest
-  HEARTBEAT_URL         (opcional) URL /api/public/heartbeat — se omitida,
-                        é derivada de INGEST_URL trocando o sufixo
-  INGEST_HMAC_SECRET    Segredo HMAC
-  QUOTEX_EMAIL / QUOTEX_PASSWORD
-  QUOTEX_ASSETS         CSV, ex.: "EURUSD_otc,GBPUSD_otc"
-  QUOTEX_TIMEFRAMES     CSV em segundos, default "60,300,900"
-  QUOTEX_ACCOUNT        "demo" (default) ou "real"
-  WORKER_ID             default "quotex-railway"
-  BACKFILL_DAYS         default 7 (usado no modo --backfill)
+Novidades Fase 4:
+- Lista de ativos é refrescada dinamicamente a partir de
+  {ACTIVE_ASSETS_URL} (default: derivado de INGEST_URL → /active-assets)
+  a cada ASSETS_REFRESH_SECONDS (default 60s). Mudanças em /settings no
+  dashboard propagam sem redeploy.
+- QUOTEX_ASSETS continua sendo o fallback inicial caso o endpoint falhe.
 """
 
 from __future__ import annotations
@@ -79,15 +67,15 @@ def env(name: str, default: str | None = None, required: bool = True) -> str:
 
 
 INGEST_URL = env("INGEST_URL")
-HEARTBEAT_URL = env(
-    "HEARTBEAT_URL",
-    INGEST_URL.rsplit("/", 1)[0] + "/heartbeat",
-    required=False,
-)
+_BASE = INGEST_URL.rsplit("/", 1)[0]
+HEARTBEAT_URL = env("HEARTBEAT_URL", _BASE + "/heartbeat", required=False)
+ACTIVE_ASSETS_URL = env("ACTIVE_ASSETS_URL", _BASE + "/active-assets", required=False)
 INGEST_HMAC_SECRET = env("INGEST_HMAC_SECRET")
 QUOTEX_EMAIL = env("QUOTEX_EMAIL")
 QUOTEX_PASSWORD = env("QUOTEX_PASSWORD")
-ASSETS = [a.strip() for a in env("QUOTEX_ASSETS").split(",") if a.strip()]
+ASSETS: list[str] = [
+    a.strip() for a in env("QUOTEX_ASSETS", "", required=False).split(",") if a.strip()
+]
 TIMEFRAMES = [
     int(t.strip())
     for t in env("QUOTEX_TIMEFRAMES", "60,300,900", required=False).split(",")
@@ -96,6 +84,7 @@ TIMEFRAMES = [
 ACCOUNT = env("QUOTEX_ACCOUNT", "demo", required=False).lower()
 WORKER_ID = env("WORKER_ID", "quotex-railway", required=False)
 BACKFILL_DAYS = int(env("BACKFILL_DAYS", "7", required=False))
+ASSETS_REFRESH_SECONDS = int(env("ASSETS_REFRESH_SECONDS", "60", required=False))
 
 
 # ---------------------------------------------------------------- http
@@ -155,6 +144,35 @@ async def heartbeat(client: httpx.AsyncClient, status: str, last_batch: int, las
         logj(logging.WARNING, "heartbeat_error", error=str(e))
 
 
+# ---------------------------------------------------------------- dynamic assets
+_last_assets_refresh: float = 0.0
+
+async def refresh_assets(client: httpx.AsyncClient, force: bool = False) -> None:
+    """Refresh ASSETS list from the platform every ASSETS_REFRESH_SECONDS."""
+    global _last_assets_refresh, ASSETS
+    now = time.time()
+    if not force and (now - _last_assets_refresh) < ASSETS_REFRESH_SECONDS:
+        return
+    _last_assets_refresh = now
+    try:
+        r = await client.get(ACTIVE_ASSETS_URL, timeout=10)
+        if r.status_code != 200:
+            logj(logging.WARNING, "active_assets_http", status=r.status_code, body=r.text[:200])
+            return
+        data = r.json()
+        new_assets = [a for a in (data.get("assets") or []) if isinstance(a, str) and a]
+        if not new_assets:
+            logj(logging.WARNING, "active_assets_empty")
+            return
+        if set(new_assets) != set(ASSETS):
+            logj(logging.INFO, "active_assets_refreshed", before=ASSETS, after=new_assets)
+            ASSETS = new_assets
+        else:
+            logj(logging.INFO, "active_assets_unchanged", count=len(ASSETS))
+    except Exception as e:  # noqa: BLE001
+        logj(logging.WARNING, "active_assets_error", error=str(e))
+
+
 # ---------------------------------------------------------------- candles
 _last_sent: dict[tuple[str, int], int] = {}
 
@@ -211,10 +229,6 @@ async def poll_once(qx: Quotex, http: httpx.AsyncClient) -> tuple[int, str | Non
 
 # ---------------------------------------------------------------- backfill
 async def backfill(qx: Quotex, http: httpx.AsyncClient) -> None:
-    """
-    Faz backfill dos últimos BACKFILL_DAYS dias para todos os ativos/timeframes.
-    Itera para trás em janelas de 60 velas. Envia em lotes de até 200.
-    """
     end_ts = time.time()
     seconds_total = BACKFILL_DAYS * 86400
     logj(logging.INFO, "backfill_start", days=BACKFILL_DAYS, assets=ASSETS, timeframes=TIMEFRAMES)
@@ -225,7 +239,7 @@ async def backfill(qx: Quotex, http: httpx.AsyncClient) -> None:
             cursor = end_ts
             target = end_ts - seconds_total
             while cursor > target:
-                window = tf * 60  # 60 velas por chamada
+                window = tf * 60
                 try:
                     candles = await qx.get_candles(asset, cursor, window, tf)
                 except Exception as e:  # noqa: BLE001
@@ -234,7 +248,6 @@ async def backfill(qx: Quotex, http: httpx.AsyncClient) -> None:
                 if not candles:
                     break
                 normalized = [n for raw in candles if (n := normalize(asset, tf, raw))]
-                # envia em lotes de 200
                 for i in range(0, len(normalized), 200):
                     await post_candles(http, normalized[i:i + 200])
                 collected += len(normalized)
@@ -242,7 +255,7 @@ async def backfill(qx: Quotex, http: httpx.AsyncClient) -> None:
                 if oldest <= 0 or oldest >= int(cursor):
                     break
                 cursor = oldest - 1
-                await asyncio.sleep(0.2)  # gentle pacing
+                await asyncio.sleep(0.2)
             logj(logging.INFO, "backfill_asset_done", asset=asset, tf=tf, candles=collected)
     logj(logging.INFO, "backfill_done")
 
@@ -270,6 +283,12 @@ async def run() -> None:
         logj(logging.WARNING, "quotex_balance_failed", error=str(e))
 
     async with httpx.AsyncClient() as http:
+        # carrega lista dinâmica antes de qualquer coleta
+        await refresh_assets(http, force=True)
+        if not ASSETS:
+            logj(logging.ERROR, "no_assets_available")
+            sys.exit(3)
+
         if args.backfill:
             await backfill(qx, http)
             await heartbeat(http, "ok", 0, None)
@@ -280,6 +299,7 @@ async def run() -> None:
         await heartbeat(http, "ok", 0, None)
         while True:
             try:
+                await refresh_assets(http)
                 count, err = await poll_once(qx, http)
                 await heartbeat(http, "ok" if not err else "degraded", count, err)
             except Exception as e:  # noqa: BLE001
