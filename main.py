@@ -308,40 +308,73 @@ async def poll_once(qx: Quotex, http: httpx.AsyncClient) -> tuple[int, str | Non
 # banco e o Supabase Realtime emite UPDATE → o gráfico chama series.update().
 RT_PUBLISH_INTERVAL = float(env("RT_PUBLISH_INTERVAL", "1.0", required=False))
 
-_rt_started: set[tuple[str, int]] = set()
+_rt_started_assets: set[str] = set()
+
+
+def _extract_realtime_payload(rt: Any) -> tuple[dict[str, Any], int] | None:
+    """Normalize pyquotex realtime payloads to {price/ohlc}, timestamp.
+
+    pyquotex currently stores `api.realtime_candles[asset]` as the raw Quotex
+    tick list: [asset, timestamp, price, direction]. Some forks/versions may
+    expose a dict of timestamp -> OHLC. This parser accepts both shapes so the
+    worker does not silently stop sending partial candles after dependency
+    changes.
+    """
+    if isinstance(rt, (list, tuple)) and len(rt) >= 3:
+        try:
+            ts = int(float(rt[1]))
+            price = float(rt[2])
+        except (TypeError, ValueError):
+            return None
+        return {"price": price}, ts
+
+    if isinstance(rt, dict):
+        direct_ts = rt.get("time", rt.get("timestamp", rt.get("t")))
+        direct_price = rt.get("close", rt.get("price", rt.get("value")))
+        if direct_ts is not None and direct_price is not None:
+            try:
+                return dict(rt), int(float(direct_ts))
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            last_ts = max(int(float(k)) for k in rt.keys())
+        except (TypeError, ValueError):
+            return None
+        current = rt.get(last_ts) or rt.get(str(last_ts))
+        if isinstance(current, dict):
+            return dict(current), last_ts
+
+    return None
 
 async def realtime_loop(qx: Quotex, http: httpx.AsyncClient) -> None:
     logj(logging.INFO, "rt_loop_starting", interval=RT_PUBLISH_INTERVAL)
     while True:
         try:
+            stream_period = min(TIMEFRAMES, default=60)
             for asset in list(ASSETS):
-                for tf in TIMEFRAMES:
-                    key = (asset, tf)
-                    if key in _rt_started:
-                        continue
-                    try:
-                        await qx.start_candles_stream(asset, tf)
-                        _rt_started.add(key)
-                        logj(logging.INFO, "rt_stream_started", asset=asset, tf=tf)
-                    except Exception as e:  # noqa: BLE001
-                        logj(logging.WARNING, "rt_stream_start_failed",
-                             asset=asset, tf=tf, error=str(e))
+                if asset in _rt_started_assets:
+                    continue
+                try:
+                    await qx.start_candles_stream(asset, stream_period)
+                    _rt_started_assets.add(asset)
+                    logj(logging.INFO, "rt_stream_started", asset=asset, period=stream_period)
+                except Exception as e:  # noqa: BLE001
+                    logj(logging.WARNING, "rt_stream_start_failed",
+                         asset=asset, period=stream_period, error=str(e))
 
             batch: list[dict[str, Any]] = []
             for asset in list(ASSETS):
+                try:
+                    rt = await qx.get_realtime_candles(asset)
+                except Exception as e:  # noqa: BLE001
+                    logj(logging.DEBUG, "rt_read_failed", asset=asset, error=str(e))
+                    continue
+                payload = _extract_realtime_payload(rt)
+                if not payload:
+                    continue
+                raw, last_ts = payload
                 for tf in TIMEFRAMES:
-                    try:
-                        rt = qx.get_realtime_candles(asset, tf)
-                    except Exception:
-                        rt = None
-                    if not rt:
-                        continue
-                    try:
-                        last_ts = max(int(k) for k in rt.keys())
-                    except ValueError:
-                        continue
-                    cur = rt[last_ts]
-                    raw = dict(cur) if isinstance(cur, dict) else {}
                     n = normalize_realtime(asset, tf, raw, last_ts)
                     if n:
                         batch.append(n)
