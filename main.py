@@ -148,29 +148,43 @@ async def heartbeat(client: httpx.AsyncClient, status: str, last_batch: int, las
 _last_assets_refresh: float = 0.0
 
 async def refresh_assets(client: httpx.AsyncClient, force: bool = False) -> None:
-    """Refresh ASSETS list from the platform every ASSETS_REFRESH_SECONDS."""
+    """Refresh ASSETS list from the platform every ASSETS_REFRESH_SECONDS.
+
+    Graceful degradation: on timeout/HTTP/parse errors keeps the last known
+    ASSETS list and logs with fallback:true so it's easy to grep in Railway.
+    """
     global _last_assets_refresh, ASSETS
     now = time.time()
     if not force and (now - _last_assets_refresh) < ASSETS_REFRESH_SECONDS:
         return
     _last_assets_refresh = now
     try:
-        r = await client.get(ACTIVE_ASSETS_URL, timeout=10)
-        if r.status_code != 200:
-            logj(logging.WARNING, "active_assets_http", status=r.status_code, body=r.text[:200])
-            return
+        r = await client.get(ACTIVE_ASSETS_URL, timeout=10.0)
+        r.raise_for_status()
         data = r.json()
         new_assets = [a for a in (data.get("assets") or []) if isinstance(a, str) and a]
         if not new_assets:
-            logj(logging.WARNING, "active_assets_empty")
+            logj(logging.WARNING, "active_assets_empty", url=ACTIVE_ASSETS_URL,
+                 kept=len(ASSETS), fallback=True)
             return
         if set(new_assets) != set(ASSETS):
-            logj(logging.INFO, "active_assets_refreshed", before=ASSETS, after=new_assets)
+            logj(logging.INFO, "active_assets_refreshed",
+                 before_count=len(ASSETS), after_count=len(new_assets),
+                 added=sorted(set(new_assets) - set(ASSETS)),
+                 removed=sorted(set(ASSETS) - set(new_assets)))
             ASSETS = new_assets
         else:
             logj(logging.INFO, "active_assets_unchanged", count=len(ASSETS))
+    except httpx.TimeoutException:
+        logj(logging.ERROR, "active_assets_fetch_timeout",
+             url=ACTIVE_ASSETS_URL, kept=len(ASSETS), fallback=True)
+    except httpx.HTTPStatusError as e:
+        logj(logging.ERROR, "active_assets_fetch_http_error",
+             url=ACTIVE_ASSETS_URL, status=e.response.status_code,
+             body=e.response.text[:200], kept=len(ASSETS), fallback=True)
     except Exception as e:  # noqa: BLE001
-        logj(logging.WARNING, "active_assets_error", error=str(e))
+        logj(logging.ERROR, "active_assets_fetch_unexpected_error",
+             url=ACTIVE_ASSETS_URL, error=str(e), kept=len(ASSETS), fallback=True)
 
 
 # ---------------------------------------------------------------- candles
@@ -225,6 +239,64 @@ async def poll_once(qx: Quotex, http: httpx.AsyncClient) -> tuple[int, str | Non
         else:
             last_err = f"ingest: {result}"
     return len(batch), last_err
+
+
+# ---------------------------------------------------------------- realtime stream (Plano A)
+# Mantém um stream de velas em formação por (asset, tf) e publica a vela
+# corrente a cada RT_PUBLISH_INTERVAL s. O ingest faz UPSERT em
+# (asset_id, timeframe, opened_at), então a vela atual é sobrescrita no
+# banco e o Supabase Realtime emite UPDATE → o gráfico chama series.update().
+RT_PUBLISH_INTERVAL = float(env("RT_PUBLISH_INTERVAL", "1.0", required=False))
+
+_rt_started: set[tuple[str, int]] = set()
+
+async def realtime_loop(qx: Quotex, http: httpx.AsyncClient) -> None:
+    logj(logging.INFO, "rt_loop_starting", interval=RT_PUBLISH_INTERVAL)
+    while True:
+        try:
+            for asset in list(ASSETS):
+                for tf in TIMEFRAMES:
+                    key = (asset, tf)
+                    if key in _rt_started:
+                        continue
+                    try:
+                        qx.start_candles_stream(asset, tf)
+                        _rt_started.add(key)
+                        logj(logging.INFO, "rt_stream_started", asset=asset, tf=tf)
+                    except Exception as e:  # noqa: BLE001
+                        logj(logging.WARNING, "rt_stream_start_failed",
+                             asset=asset, tf=tf, error=str(e))
+
+            batch: list[dict[str, Any]] = []
+            for asset in list(ASSETS):
+                for tf in TIMEFRAMES:
+                    try:
+                        rt = qx.get_realtime_candles(asset, tf)
+                    except Exception:
+                        rt = None
+                    if not rt:
+                        continue
+                    try:
+                        last_ts = max(int(k) for k in rt.keys())
+                    except ValueError:
+                        continue
+                    cur = rt[last_ts]
+                    raw = dict(cur) if isinstance(cur, dict) else {}
+                    raw["time"] = last_ts
+                    if "close" not in raw and "price" in raw:
+                        raw["close"] = raw["price"]
+                        raw.setdefault("open", raw["price"])
+                        raw.setdefault("high", raw["price"])
+                        raw.setdefault("low", raw["price"])
+                    n = normalize(asset, tf, raw)
+                    if n:
+                        batch.append(n)
+            if batch:
+                await post_candles(http, batch)
+        except Exception as e:  # noqa: BLE001
+            logj(logging.ERROR, "rt_loop_error", error=str(e))
+        await asyncio.sleep(RT_PUBLISH_INTERVAL)
+
 
 
 # ---------------------------------------------------------------- backfill
@@ -297,15 +369,21 @@ async def run() -> None:
         interval = max(15, min(min(TIMEFRAMES) // 4, 60))
         logj(logging.INFO, "poll_loop", interval_seconds=interval)
         await heartbeat(http, "ok", 0, None)
-        while True:
-            try:
-                await refresh_assets(http)
-                count, err = await poll_once(qx, http)
-                await heartbeat(http, "ok" if not err else "degraded", count, err)
-            except Exception as e:  # noqa: BLE001
-                logj(logging.ERROR, "poll_loop_error", error=str(e))
-                await heartbeat(http, "error", 0, str(e))
-            await asyncio.sleep(interval)
+
+        async def poll_forever() -> None:
+            while True:
+                try:
+                    await refresh_assets(http)
+                    count, err = await poll_once(qx, http)
+                    await heartbeat(http, "ok" if not err else "degraded", count, err)
+                except Exception as e:  # noqa: BLE001
+                    logj(logging.ERROR, "poll_loop_error", error=str(e))
+                    await heartbeat(http, "error", 0, str(e))
+                await asyncio.sleep(interval)
+
+        # roda poll (velas fechadas) + realtime (vela em formação) em paralelo
+        await asyncio.gather(poll_forever(), realtime_loop(qx, http))
+
 
 
 if __name__ == "__main__":
