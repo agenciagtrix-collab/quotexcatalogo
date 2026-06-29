@@ -106,6 +106,7 @@ function connectQuotex() {
       const payload = JSON.parse(text.slice(2));
       const [event, data] = payload;
       // Adjust event name when Quotex changes it
+       // Adjust event name when Quotex changes it
       if (event === "instruments/update" || event === "stream") {
         if (data?.asset && typeof data?.price === "number") {
           onTick({ symbol: data.asset, ts: Date.now(), price: data.price });
