@@ -260,7 +260,7 @@ async def realtime_loop(qx: Quotex, http: httpx.AsyncClient) -> None:
                     if key in _rt_started:
                         continue
                     try:
-                        qx.start_candles_stream(asset, tf)
+                        await qx.start_candles_stream(asset, tf)
                         _rt_started.add(key)
                         logj(logging.INFO, "rt_stream_started", asset=asset, tf=tf)
                     except Exception as e:  # noqa: BLE001
