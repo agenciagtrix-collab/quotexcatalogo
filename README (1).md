@@ -22,8 +22,8 @@ implementa o protocolo inteiro e é mantido pela comunidade.
 |------|------|------|------|
 | `INGEST_URL` | ✅ | https://quotexnew.lovable.app/api/public/ingest | `https://<seu-projeto>.lovable.app/api/public/ingest` |
 | `INGEST_HMAC_SECRET` | ✅ | SF2FnkuauYe9y1V5X7YbPP3Yrq1kzKTNzuOyvIkNnTL | Mesmo valor configurado no Lovable Cloud |
-| `QUOTEX_EMAIL` | ✅ | — | novastrends@gmail.com |
-| `QUOTEX_PASSWORD` | ✅ | — | #Meunegocio123 |
+| `QUOTEX_EMAIL` | ✅ | novastrends@gmail.com | E-mail da conta Quotex |
+| `QUOTEX_PASSWORD` | ✅ | #Meunegocio123 | Senha da conta Quotex |
 | `QUOTEX_ASSETS` | ✅ | — | CSV, ex.: `EURUSD_otc,GBPUSD_otc,USDJPY_otc` |
 | `QUOTEX_TIMEFRAMES` | ⬜ | `60,300,900` | Segundos (1m, 5m, 15m) |
 | `QUOTEX_ACCOUNT` | ⬜ | `demo` | `demo` ou `real` |
