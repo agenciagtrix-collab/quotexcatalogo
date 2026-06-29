@@ -189,9 +189,10 @@ async def refresh_assets(client: httpx.AsyncClient, force: bool = False) -> None
 
 # ---------------------------------------------------------------- candles
 _last_sent: dict[tuple[str, int], int] = {}
+_partial_cache: dict[tuple[str, int, int], dict[str, float]] = {}
 
 
-def normalize(asset: str, tf: int, raw: dict[str, Any]) -> dict[str, Any] | None:
+def normalize(asset: str, tf: int, raw: dict[str, Any], *, partial: bool = False) -> dict[str, Any] | None:
     try:
         ts = int(raw.get("time") or raw.get("t") or 0)
         o = float(raw["open"]); h = float(raw["high"])
@@ -205,7 +206,66 @@ def normalize(asset: str, tf: int, raw: dict[str, Any]) -> dict[str, Any] | None
         "timeframe": tf // 60,
         "opened_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
         "open": o, "high": h, "low": low, "close": c,
+        "partial": partial,
     }
+
+
+def normalize_realtime(asset: str, tf: int, raw: dict[str, Any], ts: int) -> dict[str, Any] | None:
+    """Build a stable in-formation candle from tick/realtime payloads.
+
+    Some pyquotex realtime payloads expose only a last price; others expose
+    OHLC. We always bucket timestamps to the candle open and preserve the
+    first open + high/low in memory so the chart breathes tick-by-tick without
+    polluting strategy calculations.
+    """
+    if ts <= 0:
+        return None
+    opened_ts = ts - (ts % tf)
+    price_source = raw.get("close", raw.get("price", raw.get("value")))
+    try:
+        price = float(price_source)
+    except (TypeError, ValueError):
+        return None
+
+    key = (asset, tf, opened_ts)
+    previous = _partial_cache.get(key)
+    if previous is None:
+        try:
+            open_price = float(raw.get("open", price))
+            high_price = float(raw.get("high", price))
+            low_price = float(raw.get("low", price))
+        except (TypeError, ValueError):
+            open_price = high_price = low_price = price
+        previous = {
+            "open": open_price,
+            "high": max(high_price, price),
+            "low": min(low_price, price),
+            "close": price,
+        }
+    else:
+        previous["high"] = max(previous["high"], price)
+        previous["low"] = min(previous["low"], price)
+        previous["close"] = price
+    _partial_cache[key] = previous
+
+    # Prevent unbounded growth; keep only the current/recent candle buckets.
+    min_keep_ts = opened_ts - max(TIMEFRAMES, default=tf) * 3
+    for cache_key in list(_partial_cache.keys()):
+        if cache_key[2] < min_keep_ts:
+            _partial_cache.pop(cache_key, None)
+
+    return normalize(
+        asset,
+        tf,
+        {
+            "time": opened_ts,
+            "open": previous["open"],
+            "high": previous["high"],
+            "low": previous["low"],
+            "close": previous["close"],
+        },
+        partial=True,
+    )
 
 
 async def poll_once(qx: Quotex, http: httpx.AsyncClient) -> tuple[int, str | None]:
@@ -282,13 +342,7 @@ async def realtime_loop(qx: Quotex, http: httpx.AsyncClient) -> None:
                         continue
                     cur = rt[last_ts]
                     raw = dict(cur) if isinstance(cur, dict) else {}
-                    raw["time"] = last_ts
-                    if "close" not in raw and "price" in raw:
-                        raw["close"] = raw["price"]
-                        raw.setdefault("open", raw["price"])
-                        raw.setdefault("high", raw["price"])
-                        raw.setdefault("low", raw["price"])
-                    n = normalize(asset, tf, raw)
+                    n = normalize_realtime(asset, tf, raw, last_ts)
                     if n:
                         batch.append(n)
             if batch:
